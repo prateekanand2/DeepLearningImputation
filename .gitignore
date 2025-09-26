@@ -1,0 +1,6 @@
+trained_bert_models/
+results/
+data/1KG/
+data/UKBB/
+wandb/
+*.log
