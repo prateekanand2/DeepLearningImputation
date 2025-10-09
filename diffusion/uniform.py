@@ -285,7 +285,7 @@ def train_masked_conditional(
                 best_val_loss = val_loss
                 best_epoch = epoch + 1   # record best epoch (1-based)
                 patience_counter = 0
-                torch.save(model.state_dict(), "best_model_uni.pt")
+                torch.save(model.state_dict(), "checkpoints/best_model_uni.pt")
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -383,7 +383,7 @@ if __name__ == "__main__":
     set_seed(42)
     
     # --- Logging ---
-    log_path = "train_uni.log"
+    log_path = "logs/train_uni.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -393,7 +393,7 @@ if __name__ == "__main__":
 
     # --- Setup ---
     torch.manual_seed(0)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Load training data ---
     file_path = "../data/1KG/8020_train.txt"
@@ -474,7 +474,7 @@ if __name__ == "__main__":
         x_data=x_test,
         index_file="../index_files/snp_index_file.txt",
         device=device,
-        output_path="diff_results_uni.csv",
+        output_path="results/diff_results_uni.csv",
         batch_size=batch_size
     )
 

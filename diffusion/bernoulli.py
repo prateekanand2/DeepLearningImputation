@@ -12,6 +12,55 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 import random
 
+def load_coarse_map(path):
+    bp, chr_, cm = np.loadtxt(path, dtype=float, usecols=(0, 1, 2), unpack=True)
+    # ensure sorted by bp
+    order = np.argsort(bp)
+    return bp[order], cm[order]
+
+# -----------------------------
+# Step 2: Load SNP bp positions
+# -----------------------------
+def load_snp_positions(path):
+    bps = []
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            token = line.split()[0]   # e.g. "15:27379578"
+            bp = int(token.split(":")[1])
+            bps.append(bp)
+    return np.array(bps, dtype=np.int64)
+
+# -----------------------------
+# Step 3: Interpolate cM positions for SNPs
+# -----------------------------
+def interpolate_cM_for_snps(snp_bps, map_bps, map_cms):
+    # linear interpolation, extrapolate linearly using edge slopes
+    cms_interp = np.interp(snp_bps, map_bps, map_cms)
+    left_mask = snp_bps < map_bps[0]
+    right_mask = snp_bps > map_bps[-1]
+    if left_mask.any():
+        slope = (map_cms[1] - map_cms[0]) / (map_bps[1] - map_bps[0])
+        cms_interp[left_mask] = map_cms[0] + slope * (snp_bps[left_mask] - map_bps[0])
+    if right_mask.any():
+        slope = (map_cms[-1] - map_cms[-2]) / (map_bps[-1] - map_bps[-2])
+        cms_interp[right_mask] = map_cms[-1] + slope * (snp_bps[right_mask] - map_bps[-1])
+    return cms_interp
+
+# -----------------------------
+# Step 4: Compute tau (and log tau)
+# -----------------------------
+def compute_tau(cM_positions, Ne=10000, H=1000):
+    cM = np.asarray(cM_positions, dtype=np.float64)
+    d_cM = np.diff(cM)             # difference in cM between adjacent SNPs
+    d_M = d_cM / 100.0             # convert to Morgans
+    d_M[d_M < 0] = 0.0             # guard against rounding issues
+    tau = 1.0 - np.exp(-4.0 * Ne * d_M / H)
+    tau_full = np.concatenate([[0.0], tau])
+    log_tau_full = np.log(tau_full + 1e-12)
+    return torch.tensor(tau_full, dtype=torch.float32), torch.tensor(log_tau_full, dtype=torch.float32)
+
 # class DiscreteDiffusionModel:
 #     def __init__(self, num_timesteps=100, beta_start=1e-4, beta_end=0.1, device="cpu"):
 #         self.device = device
@@ -296,58 +345,96 @@ class ResidualConvBlock(nn.Module):
         return self.relu(x + residual)
 
 
+# class ConditionalReverseConvModel(nn.Module):
+#     """
+#     Conditional reverse model for haplotype diffusion using 1D CNNs + residual blocks.
+#     Input: [batch, snps] noisy haplotype + mask
+#     """
+#     def __init__(self, snps, n_channels=256, n_blocks=8, t_emb_dim=128):
+#         super().__init__()
+#         self.snps = snps
+#         self.t_emb = SinusoidalPosEmb(t_emb_dim)
+
+#         # initial projection: haplotype + mask
+#         self.input_proj = nn.Conv1d(2, n_channels, kernel_size=3, padding=1)
+
+#         # residual blocks
+#         self.res_blocks = nn.ModuleList([
+#             ResidualConvBlock(n_channels, kernel_size=5, dilation=2**i) for i in range(n_blocks)
+#         ])
+
+#         # time embedding projection
+#         self.t_proj = nn.Linear(t_emb_dim, n_channels)
+
+#         # output projection
+#         self.output_proj = nn.Conv1d(n_channels, 1, kernel_size=1)
+
+#     def forward(self, x_t, t, mask):
+#         """
+#         x_t: [B, snps]
+#         mask: [B, snps]
+#         t: [B]
+#         """
+#         B, S = x_t.shape
+
+#         # prepare input: [B, 2, snps] (haplotype + mask)
+#         x = torch.stack([x_t, mask.float()], dim=1)
+
+#         # input projection
+#         x = self.input_proj(x)  # [B, n_channels, snps]
+
+#         # sinusoidal timestep embedding
+#         t_emb = self.t_emb(t)   # [B, t_emb_dim]
+#         t_emb = self.t_proj(t_emb).unsqueeze(-1)  # [B, n_channels, 1]
+
+#         # add timestep embedding to all positions
+#         x = x + t_emb
+
+#         # residual blocks
+#         for block in self.res_blocks:
+#             x = block(x)
+
+#         # output projection
+#         x = self.output_proj(x).squeeze(1)  # [B, snps]
+#         return x
+
 class ConditionalReverseConvModel(nn.Module):
-    """
-    Conditional reverse model for haplotype diffusion using 1D CNNs + residual blocks.
-    Input: [batch, snps] noisy haplotype + mask
-    """
     def __init__(self, snps, n_channels=256, n_blocks=8, t_emb_dim=128):
         super().__init__()
         self.snps = snps
         self.t_emb = SinusoidalPosEmb(t_emb_dim)
 
-        # initial projection: haplotype + mask
-        self.input_proj = nn.Conv1d(2, n_channels, kernel_size=3, padding=1)
+        # (x_t, mask, tau)
+        self.input_proj = nn.Conv1d(3, n_channels, kernel_size=3, padding=1)
 
-        # residual blocks
         self.res_blocks = nn.ModuleList([
             ResidualConvBlock(n_channels, kernel_size=5, dilation=2**i) for i in range(n_blocks)
         ])
-
-        # time embedding projection
         self.t_proj = nn.Linear(t_emb_dim, n_channels)
-
-        # output projection
         self.output_proj = nn.Conv1d(n_channels, 1, kernel_size=1)
 
-    def forward(self, x_t, t, mask):
+    def forward(self, x_t, t, mask, tau):
         """
         x_t: [B, snps]
         mask: [B, snps]
-        t: [B]
+        tau: [snps] or [B, snps]  (transition priors)
         """
         B, S = x_t.shape
+        if tau.dim() == 1:
+            tau = tau.unsqueeze(0).expand(B, -1)
 
-        # prepare input: [B, 2, snps] (haplotype + mask)
-        x = torch.stack([x_t, mask.float()], dim=1)
+        # [B, 3, snps]
+        x = torch.stack([x_t, mask.float(), tau], dim=1)
 
-        # input projection
-        x = self.input_proj(x)  # [B, n_channels, snps]
-
-        # sinusoidal timestep embedding
-        t_emb = self.t_emb(t)   # [B, t_emb_dim]
-        t_emb = self.t_proj(t_emb).unsqueeze(-1)  # [B, n_channels, 1]
-
-        # add timestep embedding to all positions
+        x = self.input_proj(x)
+        t_emb = self.t_emb(t)
+        t_emb = self.t_proj(t_emb).unsqueeze(-1)
         x = x + t_emb
 
-        # residual blocks
         for block in self.res_blocks:
             x = block(x)
 
-        # output projection
-        x = self.output_proj(x).squeeze(1)  # [B, snps]
-        return x
+        return self.output_proj(x).squeeze(1)
 
 class ConditionalDiscreteDiffusionModel:
     def __init__(self, num_timesteps=1000, beta_start=1e-4, beta_end=0.999, device="cpu"):
@@ -383,11 +470,14 @@ def train_masked_conditional(
     epochs=100,
     batch_size=256,
     patience=10,
+    mask_ratio=0.15,
     val_index_file=None,
     scheduler=None,
     device="cpu",
+    tau_tensor=None,
+    val_seed=1234  # ✅ ensures deterministic validation masking
 ):
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
 
     snps = train_dataset.tensors[0].shape[1]
@@ -395,88 +485,133 @@ def train_masked_conditional(
     patience_counter = 0
     best_epoch = 0
 
-    # fixed mask indices for validation
+    # --- Load fixed validation mask indices (if provided) ---
     val_mask_indices = None
-    if val_index_file is not None:
+    if val_index_file is not None and os.path.exists(val_index_file):
         val_mask_indices = np.loadtxt(val_index_file, dtype=int)
 
+    # --- Pre-generate deterministic validation mask if no file provided ---
+    fixed_val_mask = None
+    if val_loader and val_mask_indices is None:
+        logging.info("ℹ️ No val_index_file provided — using deterministic random mask for validation.")
+        rng = torch.Generator(device=device)
+        rng.manual_seed(val_seed)
+
+        # generate mask for a single validation batch shape (will be reused)
+        first_val_sample_count = val_dataset.tensors[0].shape[0]
+        fixed_val_mask = torch.ones((first_val_sample_count, snps), device=device)
+        n_mask_val = int(mask_ratio * snps)
+        for i in range(first_val_sample_count):
+            mask_indices = torch.randperm(snps, generator=rng, device=device)[:n_mask_val]
+            fixed_val_mask[i, mask_indices] = 0
+
     for epoch in range(epochs):
+        # ====================================================
+        # 🟢 TRAINING
+        # ====================================================
         model.train()
         total_loss = 0.0
 
         for (x_0,) in train_loader:
             x_0 = x_0.to(device)
+            B = x_0.size(0)
 
-            # per-sample random mask
+            # --- per-sample random mask ---
             mask = torch.ones_like(x_0, device=device)
-            n_mask = int(0.15 * snps)
-            for i in range(x_0.size(0)):
+            n_mask = int(mask_ratio * snps)
+            for i in range(B):
                 mask_indices = torch.randperm(snps, device=device)[:n_mask]
                 mask[i, mask_indices] = 0
 
-            # forward diffusion
-            t = diffusion.sample_timesteps(x_0.size(0))
+            # --- forward diffusion ---
+            t = diffusion.sample_timesteps(B)
             x_t = diffusion.q_sample(x_0, t, mask)
+            tau_batch = tau_tensor.to(device)
 
-            # loss only on masked
-            logits = model(x_t, t, mask)
+            logits = model(x_t, t, mask, tau_batch)
+
             loss = F.binary_cross_entropy_with_logits(logits, x_0, weight=(1 - mask))
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if scheduler:
-                scheduler.step()
 
-            total_loss += loss.item() * x_0.size(0)
+            total_loss += loss.item() * B
 
         avg_loss = total_loss / len(train_loader.dataset)
 
-        # Validation
+        # ====================================================
+        # 🔵 VALIDATION
+        # ====================================================
         val_loss = None
-        if val_loader and val_mask_indices is not None:
+        if val_loader:
             model.eval()
             total_val_loss = 0.0
-            mask = torch.ones(snps, device=device)
-            mask[val_mask_indices] = 0
 
             with torch.no_grad():
-                for (x_val,) in val_loader:
+                for batch_idx, (x_val,) in enumerate(val_loader):
                     x_val = x_val.to(device)
-                    t = diffusion.sample_timesteps(x_val.size(0))
-                    mask_batch = mask.unsqueeze(0).expand(x_val.size(0), -1)
+                    B_val = x_val.size(0)
 
-                    x_t = diffusion.q_sample(x_val, t, mask_batch)
-                    logits = model(x_t, t, mask_batch)
+                    if val_mask_indices is not None:
+                        # --- fixed mask from file ---
+                        mask = torch.ones(snps, device=device)
+                        mask[val_mask_indices] = 0
+                        mask_batch = mask.unsqueeze(0).expand(B_val, -1)
+                    else:
+                        # --- deterministic random mask ---
+                        mask_batch = fixed_val_mask[
+                            batch_idx * B_val : batch_idx * B_val + B_val
+                        ].to(device)
 
-                    loss = F.binary_cross_entropy_with_logits(logits, x_val, weight=(1 - mask_batch))
-                    total_val_loss += loss.item() * x_val.size(0)
+                    # --- forward diffusion ---
+                    t_val = diffusion.sample_timesteps(B_val)
+                    x_t_val = diffusion.q_sample(x_val, t_val, mask_batch)
+                    tau_batch = tau_tensor.to(device)
+
+                    logits_val = model(x_t_val, t_val, mask_batch, tau_batch)
+                    loss_val = F.binary_cross_entropy_with_logits(logits_val, x_val, weight=(1 - mask_batch))
+                    total_val_loss += loss_val.item() * B_val
 
             val_loss = total_val_loss / len(val_loader.dataset)
 
+            # --- Early Stopping ---
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_epoch = epoch + 1   # record best epoch (1-based)
+                best_epoch = epoch + 1
                 patience_counter = 0
                 torch.save(model.state_dict(), "best_model.pt")
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    logging.info(f"Early stopping at epoch {epoch+1}")
-                    return best_epoch  # return best epoch count
+                    logging.info(f"⏸ Early stopping at epoch {epoch+1}")
+                    return best_epoch
 
-        logging.info(
-            f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.4f}"
-            + (f" | Val Loss: {val_loss:.4f}" if val_loss is not None else "")
-        )
+        # ====================================================
+        # 🟡 SCHEDULER STEP + LOGGING
+        # ====================================================
+        if scheduler:
+            scheduler.step()
+
+        log_msg = f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.4f}"
+        if val_loss is not None:
+            log_msg += f" | Val Loss: {val_loss:.4f}"
+        logging.info(log_msg)
 
     return best_epoch
 
 def compute_squared_pearson_correlation(x_true, x_pred):
     vx = x_true - x_true.mean()
     vy = x_pred - x_pred.mean()
-    corr = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
-    return corr ** 2
+
+    denom = torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8
+    corr = torch.sum(vx * vy) / denom
+    corr_sq = corr ** 2
+
+    if torch.isnan(corr_sq):
+        return torch.tensor(0.0, device=x_true.device)
+
+    return corr_sq
 
 @torch.no_grad()
 def evaluate_masked_r2_reverse_diffusion(
@@ -487,6 +622,7 @@ def evaluate_masked_r2_reverse_diffusion(
     device,
     output_path=None,
     batch_size=1024,
+    tau_tensor=None
 ):
     """
     Conditional imputation using multi-step reverse diffusion.
@@ -518,10 +654,15 @@ def evaluate_masked_r2_reverse_diffusion(
         rand_noise = torch.bernoulli(0.5 * torch.ones_like(x_t))
         x_t = mask_batch * x_t + (1 - mask_batch) * rand_noise
 
-        # Reverse diffusion: iterate from last timestep to t=0
+        tau_batch = tau_tensor.to(device)
+
         for t_inv in reversed(range(diffusion.num_timesteps)):
             t_tensor = torch.full((x_t.size(0),), t_inv, dtype=torch.long, device=device)
-            logits = model(x_t, t_tensor, mask_batch)
+            logits = model(x_t, t_tensor, mask_batch, tau_batch)
+        # Reverse diffusion: iterate from last timestep to t=0
+        # for t_inv in reversed(range(diffusion.num_timesteps)):
+        #     t_tensor = torch.full((x_t.size(0),), t_inv, dtype=torch.long, device=device)
+        #     logits = model(x_t, t_tensor, mask_batch)
             x_pred = torch.sigmoid(logits)
 
             # Stochastic update: sample masked positions
@@ -549,104 +690,141 @@ def evaluate_masked_r2_reverse_diffusion(
     return avg_r2
 
 if __name__ == "__main__":
+    # ============================================================
+    # 🧪 HYPERPARAMETERS
+    # ============================================================
+    # --- Paths ---
+    DATA_DIR = "../data/1KG"
+    TRAIN_FILE = f"{DATA_DIR}/8020_train.txt"
+    TEST_FILE = f"{DATA_DIR}/8020_test.txt"
+    INDEX_FILE = "../index_files/snp_index_file.txt"
+    MAP_FILE = "/scratch2/prateek/DeepLearningImputation/1kg_15_map.txt"
+    LEGEND_FILE = "/scratch2/prateek/genetic_pc_github/aux/10K_legend.maf.txt"
+
+    LOG_PATH = "logs/train_bern.log"
+    OUTPUT_RESULTS = "results/diff_results.csv"
+
+    # --- Training ---
+    SEED = 42
+    LR = 1e-3
+    BATCH_SIZE = 32
+    TOTAL_EPOCHS = 300
+    WARMUP_EPOCHS = 30
+    PATIENCE = 10
+    VAL_SPLIT = 0.1
+    MASK_RATIO = 0.15
+
+    # --- Genetic Map / Tau ---
+    Ne = 10000
+    H = 4006
+
+    # --- Evaluation ---
+    EVAL_BATCH_SIZE = 128
+    # ============================================================
 
     # --- Set seeds for reproducibility ---
-    set_seed(42)
-    
+    set_seed(SEED)
+
     # --- Logging ---
-    log_path = "train_bern.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[logging.FileHandler(log_path), logging.StreamHandler(sys.stdout)],
+        handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
     )
     logging.info("Starting training...")
 
     # --- Setup ---
-    torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(SEED)
 
     # --- Load training data ---
-    file_path = "../data/1KG/8020_train.txt"
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+    if not os.path.exists(TRAIN_FILE):
+        raise FileNotFoundError(f"File not found: {TRAIN_FILE}")
 
-    x_data_np = np.loadtxt(file_path, dtype=np.float32)
+    x_data_np = np.loadtxt(TRAIN_FILE, dtype=np.float32)
     x_data = torch.tensor(x_data_np, dtype=torch.float32)
     samples, snps = x_data.shape
     logging.info(f"Loaded train matrix: {samples} samples × {snps} SNPs")
 
-    # maf_weights = load_maf_weights("/scratch2/prateek/genetic_pc_github/aux/10K_legend.maf.txt").to(device)
-    # print(max(maf_weights))
-
-    # --- Split train/val ---
-    x_train, x_val = train_test_split(x_data, test_size=0.1, random_state=42)
+    # --- Train/val split ---
+    x_train, x_val = train_test_split(x_data, test_size=VAL_SPLIT, random_state=SEED)
     train_dataset = TensorDataset(x_train)
     val_dataset = TensorDataset(x_val)
 
+    # --- Diffusion + Model ---
     diffusion = ConditionalDiscreteDiffusionModel(device=device)
     reverse_model = ConditionalReverseConvModel(snps=snps).to(device)
-    optimizer = torch.optim.Adam(reverse_model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(reverse_model.parameters(), lr=LR)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        warmup_epochs=WARMUP_EPOCHS,
+        total_epochs=TOTAL_EPOCHS
+    )
 
-    # Scheduler: warmup 10 epochs, cosine decay afterwards
-    total_epochs = 100
-    batch_size = 32
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_epochs=10, total_epochs=total_epochs)
+    # --- Genetic map and tau ---
+    map_bps, map_cms = load_coarse_map(MAP_FILE)
+    snp_bps = load_snp_positions(LEGEND_FILE)
+    interp_cms = interpolate_cM_for_snps(snp_bps, map_bps, map_cms)
+    tau_tensor, log_tau_tensor = compute_tau(interp_cms, Ne=Ne, H=H)
 
-    # --- Train with early stopping ---
+    # --- Initial Training (with early stopping) ---
     trained_epochs = train_masked_conditional(
         reverse_model,
         diffusion,
         train_dataset,
         val_dataset,
         optimizer=optimizer,
-        epochs=total_epochs,
-        batch_size=batch_size,
-        patience=10,
-        val_index_file="../index_files/snp_index_file.txt",
+        epochs=TOTAL_EPOCHS,
+        batch_size=BATCH_SIZE,
+        patience=PATIENCE,
+        mask_ratio=MASK_RATIO,
+        val_index_file=None,
         scheduler=scheduler,
-        device=device
+        device=device,
+        tau_tensor=log_tau_tensor
     )
-
     logging.info(f"Training stopped, best model found at {trained_epochs} epochs.")
 
-    # --- Retrain on full dataset for best number of epochs ---
-    full_dataset = TensorDataset(torch.cat([x_train, x_val], dim=0))
-    reverse_model = ConditionalReverseConvModel(snps=snps).to(device)  # reinit model
-
-    optimizer = torch.optim.Adam(reverse_model.parameters(), lr=1e-3)
-    scheduler_ft = get_cosine_schedule_with_warmup(optimizer, warmup_epochs=10, total_epochs=trained_epochs)
-
+    # --- Retrain on full dataset ---
     logging.info(f"Retraining on full dataset for {trained_epochs} epochs...")
+    full_dataset = TensorDataset(torch.cat([x_train, x_val], dim=0))
+    reverse_model = ConditionalReverseConvModel(snps=snps).to(device)  # re-init model
+    optimizer = torch.optim.Adam(reverse_model.parameters(), lr=LR)
+    scheduler_ft = get_cosine_schedule_with_warmup(
+        optimizer, warmup_epochs=WARMUP_EPOCHS, total_epochs=trained_epochs
+    )
+
     train_masked_conditional(
         reverse_model,
         diffusion,
         full_dataset,
-        val_dataset=None,   # no validation now
+        val_dataset=None,  # no validation
         optimizer=optimizer,
         epochs=trained_epochs,
-        batch_size=batch_size,
+        batch_size=BATCH_SIZE,
+        mask_ratio=MASK_RATIO,
+        val_index_file=None,
         scheduler=scheduler_ft,
-        device=device
+        device=device,
+        tau_tensor=log_tau_tensor
     )
 
     # --- Load test data ---
-    x_test = torch.tensor(
-        np.loadtxt("../data/1KG/8020_test.txt"),
-        dtype=torch.float32,
-    )
+    if not os.path.exists(TEST_FILE):
+        raise FileNotFoundError(f"File not found: {TEST_FILE}")
+    x_test = torch.tensor(np.loadtxt(TEST_FILE), dtype=torch.float32)
     samples_test, snps_test = x_test.shape
     logging.info(f"Loaded test matrix: {samples_test} samples × {snps_test} SNPs")
 
-    # --- Evaluate using index file ---
+    # --- Evaluate ---
     avg_r2 = evaluate_masked_r2_reverse_diffusion(
         model=reverse_model,
         diffusion=diffusion,
         x_data=x_test,
-        index_file="../index_files/snp_index_file.txt",
+        index_file=INDEX_FILE,
         device=device,
-        output_path="diff_results.csv",
-        batch_size=batch_size
+        output_path=OUTPUT_RESULTS,
+        batch_size=EVAL_BATCH_SIZE,
+        tau_tensor=log_tau_tensor
     )
-
     logging.info(f"✅ Final Average R²: {avg_r2:.6f}")
