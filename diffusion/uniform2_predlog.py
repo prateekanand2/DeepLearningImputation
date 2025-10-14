@@ -5,12 +5,19 @@ from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import pandas as pd
 import os
+import sys
 import logging
 import math
 import random
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import LambdaLR
 import matplotlib.pyplot as plt
+
+def log_hyperparameters(hparams: dict):
+    logging.info("========== 🧪 HYPERPARAMETERS ==========")
+    for k, v in hparams.items():
+        logging.info(f"{k:<20}: {v}")
+    logging.info("========================================")
 
 # ------------------ Utilities ------------------
 def set_seed(seed=42):
@@ -128,7 +135,8 @@ def generate_bit_diffusion(model, diffusion, x_obs, mask, steps=50, td=0.0, devi
         x_t = x_t * (1 - mask) + x_obs_bits * mask
 
     final_logits = model(x_t, torch.zeros(B, device=device), mask)
-    probs = torch.clamp(bit2int(final_logits), 0.0, 1.0)  # [0,1] probabilities
+    # probs = torch.clamp(bit2int(final_logits), 0.0, 1.0)  # [0,1] probabilities
+    probs = torch.sigmoid(final_logits)
     return probs, final_logits
 
 @torch.no_grad()
@@ -187,6 +195,7 @@ def train_bit_diffusion_1bit(
     best_val_loss = float("inf")
     patience_counter = 0
     best_epoch = 0
+    crit = nn.BCEWithLogitsLoss(reduction='none')
 
     # --- Load fixed validation mask indices from file if provided ---
     val_mask_indices = None
@@ -232,6 +241,10 @@ def train_bit_diffusion_1bit(
             x_input = x_crpt * (1 - mask) + x_bits * mask
             logits = model(x_input, t, mask)
 
+            # x_target01 = (x_bits + 1.0) / 2.0   # convert -1/+1 -> 0/1
+            # per_elem = crit(logits, x_target01)
+            # loss = (per_elem * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
+
             loss = (((logits - x_bits) ** 2) * (1 - mask)).sum() / ((1 - mask).sum() + 1e-8)
             loss.backward()
             optimizer.step()
@@ -268,9 +281,11 @@ def train_bit_diffusion_1bit(
                     x_input_val = x_crpt_val * (1 - mask_val) + x_bits_val * mask_val
                     logits_val = model(x_input_val, t_val, mask_val)
 
-                    loss_val = (((logits_val - x_bits_val) ** 2) * (1 - mask_val)).sum() / (
-                        (1 - mask_val).sum() + 1e-8
-                    )
+                    # x_target01_val = (x_bits_val + 1.0) / 2.0   # convert -1/+1 -> 0/1
+                    # per_elem_val = crit(logits_val, x_target01_val)
+                    # loss_val = (per_elem_val * (1 - mask_val)).sum() / ((1 - mask_val).sum() + 1e-8)
+
+                    loss_val = (((logits_val - x_bits_val) ** 2) * (1 - mask_val)).sum() / ((1 - mask_val).sum() + 1e-8)
                     total_val_loss += loss_val.item() * Bv
 
             avg_val_loss = total_val_loss / len(val_loader.dataset)
@@ -323,7 +338,7 @@ if __name__ == "__main__":
     TEST_FILE = f"{DATA_DIR}/8020_test.txt"
 
     TEST_SIZE = 0.1            # fraction of train set held out for val
-    MASK_RATIO = 0.5
+    MASK_RATIO = 0.15
     LR = 1e-3
     BATCH_SIZE = 64
     MAX_EPOCHS = 200
@@ -331,6 +346,8 @@ if __name__ == "__main__":
     MIN_LR = 1e-7
     R2_STEPS = 50
     SEED = 42
+
+    EVAL_BATCH_SIZE = 512
     # ============================================================
 
     # ---------------- Logging Setup ----------------
@@ -343,12 +360,34 @@ if __name__ == "__main__":
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[
             logging.FileHandler(log_file),
-            logging.StreamHandler()
+            logging.StreamHandler(sys.stdout)
         ]
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(SEED)
+
+    # ✅ Log hyperparameters
+    hparams = {
+        "DATA_DIR": DATA_DIR,
+        "TRAIN_FILE": TRAIN_FILE,
+        "TEST_FILE": TEST_FILE,
+        "INDEX_FILE": INDEX_FILE,
+        "MASK_RATIO": MASK_RATIO,
+        "LEARNING_RATE": LR,
+        "BATCH_SIZE": BATCH_SIZE,
+        "MAX_EPOCHS": MAX_EPOCHS,
+        "PATIENCE": PATIENCE,
+        "MIN_LR": MIN_LR,
+        "R2_STEPS": R2_STEPS,
+        "TEST_SIZE": TEST_SIZE,
+        "SEED": SEED,
+        "LOG_DIR": LOG_DIR,
+        "CHECKPOINT_DIR": CHECKPOINT_DIR,
+        "INITIAL_MODEL_PATH": INITIAL_MODEL_PATH,
+        "FINAL_MODEL_PATH": FINAL_MODEL_PATH
+    }
+    log_hyperparameters(hparams)
 
     # ---------------- Load Data ----------------
     x_data = torch.tensor(np.loadtxt(TRAIN_FILE), dtype=torch.float32)
@@ -359,7 +398,7 @@ if __name__ == "__main__":
     snps = x_data.shape[1]
     model = ConditionalReverseConvModel(snps=snps).to(device)
     diffusion = BitDiffusion(device=device)
-    
+
     # compute warmup as 10% of total
     warmup_epochs_initial = max(1, int(0.1 * MAX_EPOCHS))
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -396,8 +435,7 @@ if __name__ == "__main__":
     model = ConditionalReverseConvModel(snps=snps).to(device)
     diffusion = BitDiffusion(device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    
-    # recompute warmup as 10% of best_epoch
+
     warmup_epochs_retrain = max(1, int(0.1 * best_epoch))
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -432,7 +470,7 @@ if __name__ == "__main__":
         diffusion,
         x_test,
         INDEX_FILE,
-        batch_size=128,
+        batch_size=EVAL_BATCH_SIZE,
         device=device,
         steps=R2_STEPS
     )
