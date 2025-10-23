@@ -13,6 +13,48 @@ import math
 import random
 from tqdm import tqdm
 
+def chunk_sequence_with_stride(x, chunk_len=1024, stride=512):
+    """
+    x: [B, L]
+    returns: list of [B, chunk_len]
+    """
+    B, L = x.shape
+    chunks = []
+    positions = []
+    for start in range(0, L, stride):
+        end = start + chunk_len
+        if end > L:
+            # pad at the end if needed
+            pad_len = end - L
+            chunk = torch.cat([x[:, start:], torch.zeros(B, pad_len, device=x.device)], dim=1)
+        else:
+            chunk = x[:, start:end]
+            pad_len = 0
+        chunks.append(chunk)
+        positions.append((start, end, pad_len))
+        if end >= L:
+            break
+    return chunks, positions
+
+def reconstruct_from_chunks(pred_chunks, positions, seq_len):
+    """
+    pred_chunks: list of [B, chunk_len]
+    positions: (start, end, pad_len)
+    seq_len: original length
+    returns: [B, seq_len]
+    """
+    B = pred_chunks[0].shape[0]
+    preds_full = torch.zeros(B, seq_len, device=pred_chunks[0].device)
+    counts = torch.zeros(B, seq_len, device=pred_chunks[0].device)
+
+    for pred, (start, end, pad_len) in zip(pred_chunks, positions):
+        valid_len = pred.shape[1] - pad_len
+        preds_full[:, start:start+valid_len] += pred[:, :valid_len]
+        counts[:, start:start+valid_len] += 1
+
+    preds_full /= (counts + 1e-8)
+    return preds_full
+    
 def log_hyperparameters(params: dict):
     """Log hyperparameters in a clean, aligned format."""
     logging.info("📋 HYPERPARAMETERS")
@@ -155,118 +197,79 @@ class SinusoidalPosEmb(nn.Module):
             emb = torch.cat([emb, torch.zeros(t.size(0), 1, device=device)], dim=1)
         return emb
 
-
-class ResidualConvBlock(nn.Module):
-    """1D Residual convolutional block."""
-    def __init__(self, channels, kernel_size=5, dilation=1):
-        super().__init__()
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=(kernel_size//2)*dilation, dilation=dilation)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=(kernel_size//2)*dilation, dilation=dilation)
-        self.norm1 = nn.BatchNorm1d(channels)
-        self.norm2 = nn.BatchNorm1d(channels)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        residual = x
-        x = self.relu(self.norm1(self.conv1(x)))
-        x = self.norm2(self.conv2(x))
-        return self.relu(x + residual)
-
-
-# class ConditionalReverseConvModel(nn.Module):
-#     """
-#     Conditional reverse model for haplotype diffusion using 1D CNNs + residual blocks.
-#     Input: [batch, snps] noisy haplotype + mask
-#     """
-#     def __init__(self, snps, n_channels=256, n_blocks=8, t_emb_dim=128):
-#         super().__init__()
-#         self.snps = snps
-#         self.t_emb = SinusoidalPosEmb(t_emb_dim)
-
-#         # initial projection: haplotype + mask
-#         self.input_proj = nn.Conv1d(2, n_channels, kernel_size=3, padding=1)
-
-#         # residual blocks
-#         self.res_blocks = nn.ModuleList([
-#             ResidualConvBlock(n_channels, kernel_size=5, dilation=2**i) for i in range(n_blocks)
-#         ])
-
-#         # time embedding projection
-#         self.t_proj = nn.Linear(t_emb_dim, n_channels)
-
-#         # output projection
-#         self.output_proj = nn.Conv1d(n_channels, 1, kernel_size=1)
-
-#     def forward(self, x_t, t, mask):
-#         """
-#         x_t: [B, snps]
-#         mask: [B, snps]
-#         t: [B]
-#         """
-#         B, S = x_t.shape
-
-#         # prepare input: [B, 2, snps] (haplotype + mask)
-#         x = torch.stack([x_t, mask.float()], dim=1)
-
-#         # input projection
-#         x = self.input_proj(x)  # [B, n_channels, snps]
-
-#         # sinusoidal timestep embedding
-#         t_emb = self.t_emb(t)   # [B, t_emb_dim]
-#         t_emb = self.t_proj(t_emb).unsqueeze(-1)  # [B, n_channels, 1]
-
-#         # add timestep embedding to all positions
-#         x = x + t_emb
-
-#         # residual blocks
-#         for block in self.res_blocks:
-#             x = block(x)
-
-#         # output projection
-#         x = self.output_proj(x).squeeze(1)  # [B, snps]
-#         return x
-
-class ConditionalReverseConvModel(nn.Module):
-    def __init__(self, snps, n_channels=256, n_blocks=8, t_emb_dim=128):
+class ConditionalReverseTransformerModel(nn.Module):
+    def __init__(self, snps, max_seq_len=1024, d_model=256, nhead=4, num_layers=4, t_emb_dim=128):
         super().__init__()
         self.snps = snps
-        self.t_emb = SinusoidalPosEmb(t_emb_dim)
+        self.max_seq_len = max_seq_len
+        self.d_model = d_model
 
-        # Input now has 4 channels: (x_t, mask, tau, optional self-conditioning)
-        self.input_proj = nn.Conv1d(4, n_channels, kernel_size=3, padding=1)
+        # --- Embed inputs: (x_t, mask, tau, x_self_cond) ---
+        self.input_proj = nn.Linear(4, d_model)
 
-        self.res_blocks = nn.ModuleList([
-            ResidualConvBlock(n_channels, kernel_size=5, dilation=2**i) for i in range(n_blocks)
-        ])
-        self.t_proj = nn.Linear(t_emb_dim, n_channels)
-        self.output_proj = nn.Conv1d(n_channels, 1, kernel_size=1)
+        # --- Time embedding ---
+        self.time_emb = SinusoidalPosEmb(t_emb_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(t_emb_dim, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        # --- Positional embedding for sequence ---
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+
+        # --- Transformer backbone ---
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=4*d_model, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # --- Output projection ---
+        self.output_proj = nn.Linear(d_model, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.pos_emb, std=0.02)
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        nn.init.xavier_uniform_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
 
     def forward(self, x_t, t, mask, tau, x_self_cond=None):
         """
-        x_t: [B, snps]
-        mask: [B, snps]
-        tau: [snps] or [B, snps]
-        x_self_cond: [B, snps] or None (previous prediction of x0)
+        x_t: [B, L]
+        t: [B] (scalar timestep per sample)
+        mask, tau: [B, L]
         """
-        B, S = x_t.shape
-        if tau.dim() == 1:
-            tau = tau.unsqueeze(0).expand(B, -1)
+        device = x_t.device
 
+        B, L = x_t.shape
+
+        mask = mask.to(device)
+        tau = tau.to(device)
+        
         if x_self_cond is None:
-            x_self_cond = torch.zeros_like(x_t)
+            x_self_cond = torch.zeros_like(x_t, device=device)
+        else:
+            x_self_cond = x_self_cond.to(device)
 
-        # [B, 4, snps]
-        x = torch.stack([x_t, mask.float(), tau, x_self_cond], dim=1)
+        # stack inputs and embed
+        x_stack = torch.stack([x_t, mask.float(), tau, x_self_cond], dim=-1)
+        h = self.input_proj(x_stack) + self.pos_emb[:, :L, :]
 
-        x = self.input_proj(x)
-        t_emb = self.t_emb(t)
-        t_emb = self.t_proj(t_emb).unsqueeze(-1)
-        x = x + t_emb
+        # --- time embedding ---
+        t_emb = self.time_emb(t)               # [B, t_emb_dim]
+        t_emb = self.time_mlp(t_emb)           # [B, d_model]
+        t_emb = t_emb[:, None, :].expand(-1, L, -1)  # broadcast over sequence length
+        h = h + t_emb                          # additive conditioning
 
-        for block in self.res_blocks:
-            x = block(x)
+        # transformer
+        h = self.transformer(h)
 
-        return self.output_proj(x).squeeze(1)
+        # output
+        logits = self.output_proj(h).squeeze(-1)
+        return logits
 
 class ConditionalDiscreteDiffusionModel:
     def __init__(self, num_timesteps=1000, beta_start=1e-4, beta_end=0.999, device="cpu"):
@@ -307,7 +310,9 @@ def train_masked_conditional(
     scheduler=None,
     device="cpu",
     tau_tensor=None,
-    val_seed=1234  # ✅ ensures deterministic validation masking
+    val_seed=1234,
+    chunk_len=1024,
+    stride=512
 ):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
@@ -317,26 +322,27 @@ def train_masked_conditional(
     patience_counter = 0
     best_epoch = 0
 
-    # --- Load fixed validation mask indices (if provided) ---
+    # --- Load fixed validation mask indices ---
     val_mask_indices = None
     if val_index_file is not None and os.path.exists(val_index_file):
         val_mask_indices = np.loadtxt(val_index_file, dtype=int)
 
-    # --- Pre-generate deterministic validation mask if no file provided ---
+    # --- Deterministic val mask ---
     fixed_val_mask = None
     if val_loader and val_mask_indices is None:
         logging.info("ℹ️ No val_index_file provided — using deterministic random mask for validation.")
         rng = torch.Generator(device=device)
         rng.manual_seed(val_seed)
-
-        # generate mask for a single validation batch shape (will be reused)
-        first_val_sample_count = val_dataset.tensors[0].shape[0]
-        fixed_val_mask = torch.ones((first_val_sample_count, snps), device=device)
+        n_val = val_dataset.tensors[0].shape[0]
+        fixed_val_mask = torch.ones((n_val, snps), device=device)
         n_mask_val = int(mask_ratio * snps)
-        for i in range(first_val_sample_count):
+        for i in range(n_val):
             mask_indices = torch.randperm(snps, generator=rng, device=device)[:n_mask_val]
             fixed_val_mask[i, mask_indices] = 0
 
+    # ====================================================
+    # EPOCH LOOP
+    # ====================================================
     for epoch in range(epochs):
         # ====================================================
         # 🟢 TRAINING
@@ -348,35 +354,43 @@ def train_masked_conditional(
             x_0 = x_0.to(device)
             B = x_0.size(0)
 
-            # --- per-sample random mask ---
-            mask = torch.ones_like(x_0, device=device)
+            # --- random mask per sample ---
+            mask = torch.ones_like(x_0)
             n_mask = int(mask_ratio * snps)
             for i in range(B):
                 mask_indices = torch.randperm(snps, device=device)[:n_mask]
                 mask[i, mask_indices] = 0
 
-            # --- forward diffusion ---
-            t = diffusion.sample_timesteps(B)
-            x_t = diffusion.q_sample(x_0, t, mask)
-            tau_batch = tau_tensor.to(device)
+            # --- chunk inputs ---
+            x_chunks, _ = chunk_sequence_with_stride(x_0, chunk_len, stride)
+            mask_chunks, _ = chunk_sequence_with_stride(mask, chunk_len, stride)
+            tau_chunks, _ = chunk_sequence_with_stride(tau_tensor.unsqueeze(0).expand(B, -1), chunk_len, stride)
 
-            use_self_cond = torch.rand(1).item() < 0.5  # 50% chance
-            if use_self_cond:
-                with torch.no_grad():
-                    prev_logits = model(x_t, t, mask, tau_batch)
-                x_self_cond = torch.sigmoid(prev_logits)
-            else:
-                x_self_cond = None
+            loss_total = 0
+            for x_chunk, mask_chunk, tau_chunk in zip(x_chunks, mask_chunks, tau_chunks):
+                t = diffusion.sample_timesteps(B)
+                x_t = diffusion.q_sample(x_chunk, t, mask_chunk)
 
-            logits = model(x_t, t, mask, tau_batch, x_self_cond=x_self_cond)
+                # --- self-conditioning ---
+                use_self_cond = torch.rand(1).item() < 0.5
+                if use_self_cond:
+                    with torch.no_grad():
+                        prev_logits = model(x_t, t, mask_chunk, tau_chunk)
+                    x_self_cond = torch.sigmoid(prev_logits)
+                else:
+                    x_self_cond = None
 
-            loss = F.binary_cross_entropy_with_logits(logits, x_0, weight=(1 - mask))
+                logits = model(x_t, t, mask_chunk, tau_chunk, x_self_cond=x_self_cond)
+                loss = F.binary_cross_entropy_with_logits(logits, x_chunk, weight=(1 - mask_chunk))
+                loss_total += loss
+
+            loss_total /= len(x_chunks)
 
             optimizer.zero_grad()
-            loss.backward()
+            loss_total.backward()
             optimizer.step()
 
-            total_loss += loss.item() * B
+            total_loss += loss_total.item() * B
 
         avg_loss = total_loss / len(train_loader.dataset)
 
@@ -387,40 +401,46 @@ def train_masked_conditional(
         if val_loader:
             model.eval()
             total_val_loss = 0.0
-
             with torch.no_grad():
                 for batch_idx, (x_val,) in enumerate(val_loader):
                     x_val = x_val.to(device)
                     B_val = x_val.size(0)
 
+                    # --- fixed mask ---
                     if val_mask_indices is not None:
-                        # --- fixed mask from file ---
                         mask = torch.ones(snps, device=device)
                         mask[val_mask_indices] = 0
                         mask_batch = mask.unsqueeze(0).expand(B_val, -1)
                     else:
-                        # --- deterministic random mask ---
                         mask_batch = fixed_val_mask[
                             batch_idx * B_val : batch_idx * B_val + B_val
                         ].to(device)
 
-                    # --- forward diffusion ---
-                    t_val = diffusion.sample_timesteps(B_val)
-                    x_t_val = diffusion.q_sample(x_val, t_val, mask_batch)
-                    tau_batch = tau_tensor.to(device)
+                    # --- chunk val ---
+                    x_chunks_val, _ = chunk_sequence_with_stride(x_val, chunk_len, stride)
+                    mask_chunks_val, _ = chunk_sequence_with_stride(mask_batch, chunk_len, stride)
+                    tau_chunks_val, _ = chunk_sequence_with_stride(tau_tensor.unsqueeze(0).expand(B_val, -1), chunk_len, stride)
 
-                    use_self_cond_val = torch.rand(1).item() < 0.5  # 50% chance
-                    if use_self_cond_val:
-                        with torch.no_grad():
-                            prev_logits_val = model(x_t_val, t_val, mask_batch, tau_batch)
-                        x_self_cond_val = torch.sigmoid(prev_logits_val)
-                    else:
-                        x_self_cond_val = None
+                    loss_val_total = 0
+                    for x_chunk_val, mask_chunk_val, tau_chunk_val in zip(x_chunks_val, mask_chunks_val, tau_chunks_val):
+                        t_val = diffusion.sample_timesteps(B_val)
+                        x_t_val = diffusion.q_sample(x_chunk_val, t_val, mask_chunk_val)
 
-                    logits_val = model(x_t_val, t_val, mask_batch, tau_batch, x_self_cond=x_self_cond_val)
+                        use_self_cond_val = torch.rand(1).item() < 0.5
+                        if use_self_cond_val:
+                            prev_logits_val = model(x_t_val, t_val, mask_chunk_val, tau_chunk_val)
+                            x_self_cond_val = torch.sigmoid(prev_logits_val)
+                        else:
+                            x_self_cond_val = None
 
-                    loss_val = F.binary_cross_entropy_with_logits(logits_val, x_val, weight=(1 - mask_batch))
-                    total_val_loss += loss_val.item() * B_val
+                        logits_val = model(x_t_val, t_val, mask_chunk_val, tau_chunk_val, x_self_cond=x_self_cond_val)
+                        loss_val_chunk = F.binary_cross_entropy_with_logits(
+                            logits_val, x_chunk_val, weight=(1 - mask_chunk_val)
+                        )
+                        loss_val_total += loss_val_chunk
+
+                    loss_val_total /= len(x_chunks_val)
+                    total_val_loss += loss_val_total.item() * B_val
 
             val_loss = total_val_loss / len(val_loader.dataset)
 
@@ -429,7 +449,8 @@ def train_masked_conditional(
                 best_val_loss = val_loss
                 best_epoch = epoch + 1
                 patience_counter = 0
-                torch.save(model.state_dict(), "checkpoints/best_model_bern2_b38.pt")
+                os.makedirs("checkpoints", exist_ok=True)
+                torch.save(model.state_dict(), "checkpoints/best_model_bern_transformer.pt")
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -442,10 +463,10 @@ def train_masked_conditional(
         if scheduler:
             scheduler.step()
 
-        log_msg = f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.4f}"
+        msg = f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.4f}"
         if val_loss is not None:
-            log_msg += f" | Val Loss: {val_loss:.4f}"
-        logging.info(log_msg)
+            msg += f" | Val Loss: {val_loss:.4f}"
+        logging.info(msg)
 
     return best_epoch
 
@@ -473,13 +494,16 @@ def evaluate_masked_r2_reverse_diffusion(
     batch_size=1024,
     tau_tensor=None,
     n_reverse_runs=1,
-    num_sampling_steps=1000
+    num_sampling_steps=1000,
+    window_size=1024,
+    stride=512  # overlap if stride < window_size
 ):
     """
-    Evaluate masked R² by running reverse diffusion with self-conditioning.
-    - Self-conditioning is used at *every reverse step*.
-    - x_self_cond starts as zeros and gets updated each step with the previous prediction.
+    Evaluate masked R² by running reverse diffusion with self-conditioning
+    on chunked overlapping windows. If a masked SNP appears in more than one
+    window, its predicted values are averaged across windows.
     """
+
     model.eval()
     x_data = x_data.to(device)
     samples, snps = x_data.shape
@@ -488,12 +512,13 @@ def evaluate_masked_r2_reverse_diffusion(
     mask_indices = np.loadtxt(index_file, dtype=int)
     mask_vec = torch.ones(snps, device=device)
     mask_vec[mask_indices] = 0
-    mask_full = mask_vec.unsqueeze(0).expand(samples, -1)
+    full_mask = mask_vec.unsqueeze(0).expand(samples, -1)
 
-    preds = torch.zeros_like(x_data, device=device)
-    num_batches = (samples + batch_size - 1) // batch_size
+    # --- prepare accumulation buffers ---
+    pred_sum = torch.zeros_like(x_data)
+    pred_count = torch.zeros_like(x_data)
 
-    # --- Subsample timestep schedule ---
+    # --- sampling schedule ---
     t_schedule = np.linspace(
         diffusion.num_timesteps - 1,
         0,
@@ -501,63 +526,71 @@ def evaluate_masked_r2_reverse_diffusion(
         dtype=int
     )
 
-    for start in tqdm(
-        range(0, samples, batch_size),
-        desc="Batches",
-        total=num_batches,
-        position=0
-    ):
+    # --- define chunk start positions ---
+    chunk_starts = list(range(0, snps - window_size + 1, stride))
+    if chunk_starts[-1] + window_size < snps:
+        chunk_starts.append(snps - window_size)  # last tail chunk
+
+    num_chunks = len(chunk_starts)
+    num_batches = (samples + batch_size - 1) // batch_size
+
+    # Move tau_tensor to device once
+    tau_tensor = tau_tensor.to(device)
+
+    for start in tqdm(range(0, samples, batch_size), total=num_batches, desc="Batches"):
         end = min(start + batch_size, samples)
         x_batch = x_data[start:end]
-        mask_batch = mask_full[start:end]
-        tau_batch = tau_tensor.to(device)
+        mask_batch_full = full_mask[start:end]
 
-        pred_accum = torch.zeros_like(x_batch)
+        for chunk_i, chunk_start in enumerate(tqdm(chunk_starts, leave=False, desc="Chunks")):
+            chunk_end = chunk_start + window_size
 
-        for run_idx in tqdm(
-            range(n_reverse_runs),
-            desc="Reverse runs",
-            leave=False,
-            position=1
-        ):
-            # --- initialize noise at masked positions ---
-            rand_noise = torch.bernoulli(0.5 * torch.ones_like(x_batch))
-            x_t = mask_batch * x_batch + (1 - mask_batch) * rand_noise
+            x_chunk = x_batch[:, chunk_start:chunk_end]
+            mask_chunk = mask_batch_full[:, chunk_start:chunk_end]
 
-            # 🆕 Start self-conditioning as zeros at t = T
-            x_self_cond = torch.zeros_like(x_t)
+            # ✅ slice tau correctly for this chunk
+            tau_chunk = tau_tensor[chunk_start:chunk_end]
+            tau_chunk = tau_chunk.unsqueeze(0).expand(x_chunk.size(0), -1)
 
-            for t_inv in tqdm(
-                t_schedule,
-                desc="Timesteps",
-                leave=False,
-                position=2,
-                total=len(t_schedule)
-            ):
-                t_tensor = torch.full(
-                    (x_t.size(0),),
-                    t_inv,
-                    dtype=torch.long,
-                    device=device
-                )
+            pred_chunk_accum = torch.zeros_like(x_chunk)
 
-                # 🆕 Always use self-conditioning
-                logits = model(x_t, t_tensor, mask_batch, tau_batch, x_self_cond=x_self_cond)
-                x_pred = torch.sigmoid(logits)
+            for run_idx in range(n_reverse_runs):
+                # initialize noise at masked positions
+                rand_noise = torch.bernoulli(0.5 * torch.ones_like(x_chunk))
+                x_t = mask_chunk * x_chunk + (1 - mask_chunk) * rand_noise
 
-                # deterministic update
-                x_t = mask_batch * x_batch + (1 - mask_batch) * x_pred
+                # initialize self-conditioning as zeros
+                x_self_cond = torch.zeros_like(x_t)
 
-                # 🆕 Update self-conditioning for next step (detach to avoid graph buildup)
-                x_self_cond = x_pred.detach()
+                # reverse diffusion timesteps
+                for t_inv in t_schedule:
+                    t_tensor = torch.full((x_t.size(0),), t_inv, dtype=torch.long, device=device)
 
-            pred_accum += x_t
+                    logits = model(x_t, t_tensor, mask_chunk, tau_chunk, x_self_cond=x_self_cond)
+                    x_pred = torch.sigmoid(logits)
 
-        preds[start:end] = pred_accum / n_reverse_runs
+                    # deterministic update: observed + predicted masked
+                    x_t = mask_chunk * x_chunk + (1 - mask_chunk) * x_pred
 
-    # --- Compute per-SNP R² ---
+                    # update self-conditioning
+                    x_self_cond = x_pred.detach()
+
+                pred_chunk_accum += x_t
+
+            # average across runs
+            pred_chunk = pred_chunk_accum / n_reverse_runs
+
+            # --- accumulate results into global prediction tensor ---
+            pred_sum[start:end, chunk_start:chunk_end] += pred_chunk
+            pred_count[start:end, chunk_start:chunk_end] += 1
+
+    # --- finalize averaged predictions ---
+    pred_count[pred_count == 0] = 1
+    preds = pred_sum / pred_count
+
+    # --- compute R² on masked SNPs ---
     r2_list = []
-    for feat_idx in tqdm(mask_indices, desc="Computing R²", position=0):
+    for feat_idx in tqdm(mask_indices, desc="Computing R²"):
         true_vals = x_data[:, feat_idx]
         pred_vals = preds[:, feat_idx]
         r2 = compute_squared_pearson_correlation(true_vals, pred_vals)
@@ -566,18 +599,20 @@ def evaluate_masked_r2_reverse_diffusion(
     avg_r2 = float(np.mean(r2_list))
     logging.info(
         f"Average R² across masked SNPs (n={n_reverse_runs} runs, "
-        f"{num_sampling_steps} steps, self-cond=ON): {avg_r2:.6f}"
+        f"{num_sampling_steps} steps, self-cond=ON, chunked inference): {avg_r2:.6f}"
     )
 
+    # --- optionally save per-SNP R² ---
     if output_path:
         df = pd.DataFrame({"SNP_Index": mask_indices, "R2": r2_list})
         df.to_csv(output_path, index=False, float_format="%.8f")
 
     return avg_r2
 
+
 if __name__ == "__main__":
     # ============================================================
-    # HYPERPARAMETERS
+    # 🧪 HYPERPARAMETERS
     # ============================================================
     # --- Paths ---
     DATA_DIR = "/scratch2/prateek/genetic_pc_github/results/b38/8020/data"
@@ -587,22 +622,24 @@ if __name__ == "__main__":
     MAP_FILE = "/scratch2/prateek/DeepLearningImputation/1kg_15_map_b38.txt"
     LEGEND_FILE = "/scratch2/prateek/genetic_pc_github/aux/b38_legend.maf.txt"
 
-    LOG_PATH = "logs/train_bern2_b38.log"
-    OUTPUT_RESULTS = "results/diff_results_bern2_b38.csv"
+    LOG_PATH = "logs/train_bern_transformer_b38.log"
+    OUTPUT_RESULTS = "results/diff_results_bern_transformer_b38.csv"
 
     # --- Model checkpoints ---
-    FINAL_MODEL_PATH = "checkpoints/best_model_bern2_b38.pt"
+    FINAL_MODEL_PATH = "checkpoints/best_model_bern_transformer_b38.pt"
 
     # --- Training ---
     SEED = 42
     LR = 1e-3
     MIN_LR = 1e-7
-    BATCH_SIZE = 32
+    BATCH_SIZE = 8
     TOTAL_EPOCHS = 200
     PATIENCE = 20
     VAL_SPLIT = 0.1
     MASK_RATIO = 0.5
-    SKIP_TRAINING = False   # ✅ Set True to skip training and load model from disk
+    SKIP_TRAINING = False   # Set True to skip training and load model from disk
+    WINDOW_SIZE = 1024
+    STRIDE = 512
 
     # --- Genetic Map / Tau ---
     Ne = 10000
@@ -621,7 +658,7 @@ if __name__ == "__main__":
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
     )
-    logging.info("🚀 Starting conditional diffusion pipeline...")
+    logging.info("Starting conditional diffusion pipeline...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -642,13 +679,13 @@ if __name__ == "__main__":
 
     # --- Model & diffusion setup ---
     diffusion = ConditionalDiscreteDiffusionModel(device=device)
-    reverse_model = ConditionalReverseConvModel(snps=snps).to(device)
+    reverse_model = ConditionalReverseTransformerModel(snps=snps).to(device)
 
     # ============================================================
-    # 🏋️ TRAINING (optional)
+    # TRAINING (optional)
     # ============================================================
     if not SKIP_TRAINING:
-        logging.info("🟢 Training enabled.")
+        logging.info("Training enabled.")
 
         # Split into train/val
         x_train, x_val = train_test_split(x_data, test_size=VAL_SPLIT, random_state=SEED)
@@ -677,14 +714,16 @@ if __name__ == "__main__":
             val_index_file=None,
             scheduler=scheduler,
             device=device,
-            tau_tensor=log_tau_tensor
+            tau_tensor=log_tau_tensor,
+            chunk_len=WINDOW_SIZE,
+            stride=STRIDE
         )
-        logging.info(f"✅ Best validation model found at {trained_epochs} epochs.")
+        logging.info(f"Best validation model found at {trained_epochs} epochs.")
 
         # --- Retrain on full dataset ---
-        logging.info(f"🔁 Retraining on full dataset for {trained_epochs} epochs...")
+        logging.info(f"Retraining on full dataset for {trained_epochs} epochs...")
         full_dataset = TensorDataset(torch.cat([x_train, x_val], dim=0))
-        reverse_model = ConditionalReverseConvModel(snps=snps).to(device)
+        reverse_model = ConditionalReverseTransformerModel(snps=snps).to(device)
         optimizer = torch.optim.Adam(reverse_model.parameters(), lr=LR)
         scheduler_ft = get_cosine_schedule_with_warmup(
             optimizer,
@@ -705,26 +744,28 @@ if __name__ == "__main__":
             val_index_file=None,
             scheduler=scheduler_ft,
             device=device,
-            tau_tensor=log_tau_tensor
+            tau_tensor=log_tau_tensor,
+            chunk_len=WINDOW_SIZE,
+            stride=STRIDE
         )
 
         # --- Save retrained model ---
         torch.save(reverse_model.state_dict(), FINAL_MODEL_PATH)
-        logging.info(f"💾 Saved final full-dataset model to {FINAL_MODEL_PATH}")
+        logging.info(f"Saved final full-dataset model to {FINAL_MODEL_PATH}")
 
     else:
         # ============================================================
-        # 🚫 SKIP TRAINING — LOAD MODEL
+        # SKIP TRAINING — LOAD MODEL
         # ============================================================
         logging.info("⚡ Skipping training — loading pre-trained model.")
         if os.path.exists(FINAL_MODEL_PATH):
             reverse_model.load_state_dict(torch.load(FINAL_MODEL_PATH, map_location=device))
             logging.info(f"✅ Loaded final model from {FINAL_MODEL_PATH}")
         else:
-            raise FileNotFoundError("❌ No saved model found. Please run training first.")
+            raise FileNotFoundError("No saved model found. Please run training first.")
 
     # ============================================================
-    # 📊 EVALUATION
+    # EVALUATION
     # ============================================================
     if not os.path.exists(TEST_FILE):
         raise FileNotFoundError(f"File not found: {TEST_FILE}")
@@ -741,6 +782,8 @@ if __name__ == "__main__":
         device=device,
         output_path=OUTPUT_RESULTS,
         batch_size=EVAL_BATCH_SIZE,
-        tau_tensor=log_tau_tensor
+        tau_tensor=log_tau_tensor,
+        window_size=WINDOW_SIZE,
+        stride=STRIDE
     )
-    logging.info(f"🏁 Final Average R²: {avg_r2:.6f}")
+    logging.info(f"Final Average R²: {avg_r2:.6f}")

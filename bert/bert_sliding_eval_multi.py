@@ -8,7 +8,8 @@ from scipy.stats import pearsonr
 import json
 import os
 import csv
-from collections import Counter
+from collections import defaultdict
+from scipy.special import softmax
 
 class SimpleTokenizer:
     def __init__(self, tokenizer_dir):
@@ -34,10 +35,8 @@ def compute_r2(y_true, y_pred):
 class SNPDataset(Dataset):
     def __init__(self, hap_array):
         self.hap_array = hap_array
-
     def __len__(self):
         return len(self.hap_array)
-
     def __getitem__(self, idx):
         return self.hap_array[idx]
 
@@ -56,7 +55,7 @@ def sliding_window_indices(seq_len, window_size=512, stride=256):
         starts.append(seq_len - window_size)
     return starts
 
-def infer_and_compute_r2(model_path, test_file, out_file, window_size, stride, batch_size=128, device='cuda', maf_file=None, snp_filter="all", snp_index_file=None, ):
+def infer_and_compute_r2(model_path, test_file, out_file, window_size, stride, batch_size=128, device='cuda', maf_file=None, snp_filter="all", snp_index_file=None, aggregate_predictions="best"):
     model = BertForMaskedLM.from_pretrained(model_path).to(device)
     model.eval()
     tokenizer = SimpleTokenizer(model_path)
@@ -68,11 +67,9 @@ def infer_and_compute_r2(model_path, test_file, out_file, window_size, stride, b
     snp_indices = np.arange(seq_len)
     if snp_filter == "common" and maf_file:
         mafs = load_maf(maf_file)
-        assert len(mafs) == seq_len
         snp_indices = np.where(mafs > 1e-1)[0]
     elif snp_filter == "rare" and maf_file:
         mafs = load_maf(maf_file)
-        assert len(mafs) == seq_len
         snp_indices = np.where(mafs < 1e-3)[0]
     elif snp_filter == "file" and snp_index_file:
         with open(snp_index_file, "r") as f:
@@ -81,65 +78,69 @@ def infer_and_compute_r2(model_path, test_file, out_file, window_size, stride, b
 
     print(f"{len(snp_indices)} SNPs selected for filter: '{snp_filter}'")
 
-    half_window = window_size // 2
     starts = sliding_window_indices(seq_len, window_size, stride=stride)
 
-    # Assign each SNP to its best window
-    snp_best_window = {}
-    for snp_idx in snp_indices:
-        best_start = min(starts, key=lambda s: abs((s + half_window) - snp_idx))
-        snp_best_window[snp_idx] = best_start
+    # --- Multi-window or best-window assignment ---
+    if aggregate_predictions == "best":
+        half_window = window_size // 2
+        snp_best_window = {s: min(starts, key=lambda st: abs((st + half_window) - s)) for s in snp_indices}
+        snp_to_windows = {s: [snp_best_window[s]] for s in snp_indices}
+    else:  # multi-window mode
+        snp_to_windows = {s: [] for s in snp_indices}
+        for s in snp_indices:
+            for st in starts:
+                if st <= s < st + window_size:
+                    snp_to_windows[s].append(st)
 
-    # Group SNPs by window start
-    window_to_snps = {}
-    for snp_idx, w_start in snp_best_window.items():
-        window_to_snps.setdefault(w_start, []).append(snp_idx)
-
-    snp_to_r2 = {}
+    # For accumulating logits
+    snp_logits_accum = defaultdict(list)
 
     # Process each window once
-    for w_start, snps_in_window in tqdm(window_to_snps.items(), desc="Processing windows"):
-        window_data = hap_array[:, w_start:w_start + window_size]
+    for w_start in tqdm(starts, desc="Processing windows"):
+        snps_in_window = [s for s in snp_indices if w_start in snp_to_windows[s]]
+        if not snps_in_window:
+            continue
 
-        # Mask all SNPs in this window at once
+        window_data = hap_array[:, w_start:w_start + window_size]
         masked_copy = window_data.copy()
-        positions_in_window = [snp_idx - w_start for snp_idx in snps_in_window]
+        positions_in_window = [s - w_start for s in snps_in_window]
         for pos in positions_in_window:
             masked_copy[:, pos] = tokenizer.mask_token_id
 
         dataset = SNPDataset(torch.tensor(masked_copy, dtype=torch.long))
         dataloader = DataLoader(dataset, batch_size=batch_size)
 
-        # Collect predictions for all individuals, all positions
-        all_probs = []
+        all_logits = []
         for batch in dataloader:
             batch = batch.to(device)
             with torch.no_grad():
-                attention_mask = torch.ones_like(batch, dtype=torch.long)
-                outputs = model(input_ids=batch, attention_mask=attention_mask)
+                attn_mask = torch.ones_like(batch, dtype=torch.long)
+                outputs = model(input_ids=batch, attention_mask=attn_mask)
                 logits = outputs.logits[..., :2]
-                probs = torch.softmax(logits, dim=-1)  # shape [B, window_size, 2]
+            all_logits.append(logits.cpu().numpy())
 
-            all_probs.append(probs[:, :, 1].cpu().numpy())  # take allele=1 probs
+        all_logits = np.vstack(all_logits)  # (num_indiv, window_size, 2)
 
-        all_probs = np.vstack(all_probs)  # shape (num_indiv, window_size)
-
-        # Compute R² for each masked SNP
         for snp_idx, pos_in_window in zip(snps_in_window, positions_in_window):
-            snp_preds = all_probs[:, pos_in_window]        # model probs
-            snp_labels = window_data[:, pos_in_window]     # true alleles
-            r2 = compute_r2(snp_labels, snp_preds)
-            snp_to_r2[snp_idx] = r2
+            snp_logits_accum[snp_idx].append(all_logits[:, pos_in_window, :])
 
-    # Return R² in the order of snp_indices
+    # --- Aggregate logits and compute R² ---
+    snp_to_r2 = {}
+    for snp_idx in snp_indices:
+        logits_list = snp_logits_accum[snp_idx]
+        if not logits_list:
+            continue
+        avg_logits = np.mean(logits_list, axis=0)  # (num_indiv, 2)
+        probs = softmax(avg_logits, axis=-1)[:, 1]
+        labels = hap_array[:, snp_idx]
+        snp_to_r2[snp_idx] = compute_r2(labels, probs)
+
     ordered_r2s = [snp_to_r2[i] for i in snp_indices]
     print(f"Mean R² over selected SNPs: {np.mean(ordered_r2s):.4f}")
 
-    # Only do this if a MAF file is provided
+    # Optional output with MAFs
     if maf_file:
-        # Reload SNP names and MAFs from file
-        snp_names = []
-        mafs = []
+        snp_names, mafs = [], []
         with open(maf_file) as f:
             for line in f:
                 parts = line.strip().split()
@@ -147,13 +148,11 @@ def infer_and_compute_r2(model_path, test_file, out_file, window_size, stride, b
                     snp_names.append(parts[0])
                     mafs.append(float(parts[1]))
 
-        # Filter SNPs if needed (same logic as before)
         if snp_filter == "common":
             filtered_indices = np.where(np.array(mafs) > 1e-1)[0]
         elif snp_filter == "rare":
             filtered_indices = np.where(np.array(mafs) < 1e-3)[0]
         elif snp_filter == "file":
-            assert snp_index_file is not None, "snp_index_file must be provided when snp_filter='file'"
             with open(snp_index_file) as f:
                 filtered_indices = [int(line.strip()) for line in f if line.strip()]
             filtered_indices = np.array(filtered_indices)
@@ -173,16 +172,18 @@ def infer_and_compute_r2(model_path, test_file, out_file, window_size, stride, b
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", required=True, help="Path to trained BERT model directory")
-    parser.add_argument("--test_file", required=True, help="Path to test data (haplotype matrix)")
-    parser.add_argument("--out", required=True, help="Path to output file")
+    parser.add_argument("--model_path", required=True)
+    parser.add_argument("--test_file", required=True)
+    parser.add_argument("--out", required=True)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--maf_file", type=str, help="Path to legend file with MAFs")
-    parser.add_argument("--snp_filter", choices=["all", "common", "rare", "file"], default="all", help="Filter SNPs by MAF")
-    parser.add_argument("--snp_index_file", help="Filter SNPs by indices")
+    parser.add_argument("--maf_file", type=str)
+    parser.add_argument("--snp_filter", choices=["all", "common", "rare", "file"], default="all")
+    parser.add_argument("--snp_index_file")
     parser.add_argument("--window_size", type=int, default=512)
     parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--aggregate_predictions", choices=["best", "multi"], default="best",
+                        help="Aggregate SNP predictions using only the best window or multiple windows (logit avg).")
     args = parser.parse_args()
 
     infer_and_compute_r2(
@@ -195,5 +196,6 @@ if __name__ == "__main__":
         device=args.device,
         maf_file=args.maf_file,
         snp_filter=args.snp_filter,
-        snp_index_file=args.snp_index_file
+        snp_index_file=args.snp_index_file,
+        aggregate_predictions=args.aggregate_predictions
     )
