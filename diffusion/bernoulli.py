@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 def log_hyperparameters(params: dict):
     """Log hyperparameters in a clean, aligned format."""
-    logging.info("📋 HYPERPARAMETERS")
+    logging.info("HYPERPARAMETERS")
     logging.info("=" * 50)
     for key, value in params.items():
         logging.info(f"{key:<20} : {value}")
@@ -303,7 +303,7 @@ def train_masked_conditional(
     scheduler=None,
     device="cpu",
     tau_tensor=None,
-    val_seed=1234  # ✅ ensures deterministic validation masking
+    val_seed=1234  # ensures deterministic validation masking
 ):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
@@ -321,7 +321,7 @@ def train_masked_conditional(
     # --- Pre-generate deterministic validation mask if no file provided ---
     fixed_val_mask = None
     if val_loader and val_mask_indices is None:
-        logging.info("ℹ️ No val_index_file provided — using deterministic random mask for validation.")
+        logging.info("No val_index_file provided — using deterministic random mask for validation.")
         rng = torch.Generator(device=device)
         rng.manual_seed(val_seed)
 
@@ -335,7 +335,7 @@ def train_masked_conditional(
 
     for epoch in range(epochs):
         # ====================================================
-        # 🟢 TRAINING
+        # TRAINING
         # ====================================================
         model.train()
         total_loss = 0.0
@@ -369,7 +369,7 @@ def train_masked_conditional(
         avg_loss = total_loss / len(train_loader.dataset)
 
         # ====================================================
-        # 🔵 VALIDATION
+        # VALIDATION
         # ====================================================
         val_loss = None
         if val_loader:
@@ -416,7 +416,7 @@ def train_masked_conditional(
                     return best_epoch
 
         # ====================================================
-        # 🟡 SCHEDULER STEP + LOGGING
+        # SCHEDULER STEP + LOGGING
         # ====================================================
         if scheduler:
             scheduler.step()
@@ -452,7 +452,7 @@ def evaluate_masked_r2_reverse_diffusion(
     batch_size=1024,
     tau_tensor=None,
     n_reverse_runs=5,
-    num_sampling_steps=1000  # << fewer timesteps at inference
+    num_sampling_steps=1000
 ):
     model.eval()
     x_data = x_data.to(device)
@@ -547,7 +547,7 @@ def evaluate_masked_r2_reverse_diffusion(
 
 if __name__ == "__main__":
     # ============================================================
-    # 🧪 HYPERPARAMETERS
+    # HYPERPARAMETERS
     # ============================================================
     # --- Paths ---
     DATA_DIR = "../data/1KG"
@@ -572,7 +572,7 @@ if __name__ == "__main__":
     PATIENCE = 20
     VAL_SPLIT = 0.1
     MASK_RATIO = 0.15
-    SKIP_TRAINING = False   # ✅ Set True to skip training and load model from disk
+    SKIP_TRAINING = False   # Set True to skip training and load model from disk
 
     # --- Genetic Map / Tau ---
     Ne = 10000
@@ -591,7 +591,7 @@ if __name__ == "__main__":
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
     )
-    logging.info("🚀 Starting conditional diffusion pipeline...")
+    logging.info("Starting conditional diffusion pipeline...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -618,7 +618,7 @@ if __name__ == "__main__":
     # 🏋️ TRAINING (optional)
     # ============================================================
     if not SKIP_TRAINING:
-        logging.info("🟢 Training enabled.")
+        logging.info("Training enabled.")
 
         # Split into train/val
         x_train, x_val = train_test_split(x_data, test_size=VAL_SPLIT, random_state=SEED)
@@ -649,10 +649,10 @@ if __name__ == "__main__":
             device=device,
             tau_tensor=log_tau_tensor
         )
-        logging.info(f"✅ Best validation model found at {trained_epochs} epochs.")
+        logging.info(f"Best validation model found at {trained_epochs} epochs.")
 
         # --- Retrain on full dataset ---
-        logging.info(f"🔁 Retraining on full dataset for {trained_epochs} epochs...")
+        logging.info(f"Retraining on full dataset for {trained_epochs} epochs...")
         full_dataset = TensorDataset(torch.cat([x_train, x_val], dim=0))
         reverse_model = ConditionalReverseConvModel(snps=snps).to(device)
         optimizer = torch.optim.Adam(reverse_model.parameters(), lr=LR)
@@ -680,18 +680,18 @@ if __name__ == "__main__":
 
         # --- Save retrained model ---
         torch.save(reverse_model.state_dict(), FINAL_MODEL_PATH)
-        logging.info(f"💾 Saved final full-dataset model to {FINAL_MODEL_PATH}")
+        logging.info(f"Saved final full-dataset model to {FINAL_MODEL_PATH}")
 
     else:
         # ============================================================
-        # 🚫 SKIP TRAINING — LOAD MODEL
+        # SKIP TRAINING — LOAD MODEL
         # ============================================================
-        logging.info("⚡ Skipping training — loading pre-trained model.")
+        logging.info("Skipping training — loading pre-trained model.")
         if os.path.exists(FINAL_MODEL_PATH):
             reverse_model.load_state_dict(torch.load(FINAL_MODEL_PATH, map_location=device))
-            logging.info(f"✅ Loaded final model from {FINAL_MODEL_PATH}")
+            logging.info(f"Loaded final model from {FINAL_MODEL_PATH}")
         else:
-            raise FileNotFoundError("❌ No saved model found. Please run training first.")
+            raise FileNotFoundError("No saved model found. Please run training first.")
 
     # ============================================================
     # 📊 EVALUATION
@@ -713,4 +713,4 @@ if __name__ == "__main__":
         batch_size=EVAL_BATCH_SIZE,
         tau_tensor=log_tau_tensor
     )
-    logging.info(f"🏁 Final Average R²: {avg_r2:.6f}")
+    logging.info(f"Final Average R²: {avg_r2:.6f}")

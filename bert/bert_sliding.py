@@ -393,7 +393,7 @@ def main(args):
     num_training_steps = len(train_loader) * args.epochs
     num_warmup_steps = int(0.1 * num_training_steps)  # 10% warmup
 
-    scheduler = get_linear_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps
@@ -474,7 +474,7 @@ def main(args):
     scaler = GradScaler()
 
     num_training_steps = len(full_loader) * best_epoch
-    scheduler = get_linear_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(0.1 * num_training_steps),
         num_training_steps=num_training_steps

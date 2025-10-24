@@ -330,7 +330,7 @@ def train_masked_conditional(
     # --- Deterministic val mask ---
     fixed_val_mask = None
     if val_loader and val_mask_indices is None:
-        logging.info("ℹ️ No val_index_file provided — using deterministic random mask for validation.")
+        logging.info("No val_index_file provided — using deterministic random mask for validation.")
         rng = torch.Generator(device=device)
         rng.manual_seed(val_seed)
         n_val = val_dataset.tensors[0].shape[0]
@@ -345,7 +345,7 @@ def train_masked_conditional(
     # ====================================================
     for epoch in range(epochs):
         # ====================================================
-        # 🟢 TRAINING
+        # TRAINING
         # ====================================================
         model.train()
         total_loss = 0.0
@@ -395,7 +395,7 @@ def train_masked_conditional(
         avg_loss = total_loss / len(train_loader.dataset)
 
         # ====================================================
-        # 🔵 VALIDATION
+        # VALIDATION
         # ====================================================
         val_loss = None
         if val_loader:
@@ -458,7 +458,7 @@ def train_masked_conditional(
                     return best_epoch
 
         # ====================================================
-        # 🟡 SCHEDULER STEP + LOGGING
+        # SCHEDULER STEP + LOGGING
         # ====================================================
         if scheduler:
             scheduler.step()
@@ -612,7 +612,7 @@ def evaluate_masked_r2_reverse_diffusion(
 
 if __name__ == "__main__":
     # ============================================================
-    # 🧪 HYPERPARAMETERS
+    # HYPERPARAMETERS
     # ============================================================
     # --- Paths ---
     DATA_DIR = "/scratch2/prateek/genetic_pc_github/results/b38/8020/data"
@@ -757,10 +757,10 @@ if __name__ == "__main__":
         # ============================================================
         # SKIP TRAINING — LOAD MODEL
         # ============================================================
-        logging.info("⚡ Skipping training — loading pre-trained model.")
+        logging.info("Skipping training — loading pre-trained model.")
         if os.path.exists(FINAL_MODEL_PATH):
             reverse_model.load_state_dict(torch.load(FINAL_MODEL_PATH, map_location=device))
-            logging.info(f"✅ Loaded final model from {FINAL_MODEL_PATH}")
+            logging.info(f"Loaded final model from {FINAL_MODEL_PATH}")
         else:
             raise FileNotFoundError("No saved model found. Please run training first.")
 
