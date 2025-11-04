@@ -1,2 +1,2 @@
 # DeepLearningImputation
-Imputation of genetic variants using deep learning methods (discrete diffusion and BERT)
+Imputation of genetic variants using deep learning methods (discrete diffusion and BERT). Work in progress.

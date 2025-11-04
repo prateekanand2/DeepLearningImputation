@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 import random
 from tqdm import tqdm
+import wandb
 
 def log_hyperparameters(params: dict):
     """Log hyperparameters in a clean, aligned format."""
@@ -308,7 +309,8 @@ def train_masked_conditional(
     device="cpu",
     tau_tensor=None,
     val_seed=1234  # ensures deterministic validation masking
-):
+): 
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
 
@@ -328,8 +330,6 @@ def train_masked_conditional(
         logging.info("No val_index_file provided — using deterministic random mask for validation.")
         rng = torch.Generator(device=device)
         rng.manual_seed(val_seed)
-
-        # generate mask for a single validation batch shape (will be reused)
         first_val_sample_count = val_dataset.tensors[0].shape[0]
         fixed_val_mask = torch.ones((first_val_sample_count, snps), device=device)
         n_mask_val = int(mask_ratio * snps)
@@ -360,7 +360,7 @@ def train_masked_conditional(
             x_t = diffusion.q_sample(x_0, t, mask)
             tau_batch = tau_tensor.to(device)
 
-            use_self_cond = torch.rand(1).item() < 0.5  # 50% chance
+            use_self_cond = torch.rand(1).item() < 0.5
             if use_self_cond:
                 with torch.no_grad():
                     prev_logits = model(x_t, t, mask, tau_batch)
@@ -369,7 +369,6 @@ def train_masked_conditional(
                 x_self_cond = None
 
             logits = model(x_t, t, mask, tau_batch, x_self_cond=x_self_cond)
-
             loss = F.binary_cross_entropy_with_logits(logits, x_0, weight=(1 - mask))
 
             optimizer.zero_grad()
@@ -394,22 +393,19 @@ def train_masked_conditional(
                     B_val = x_val.size(0)
 
                     if val_mask_indices is not None:
-                        # --- fixed mask from file ---
                         mask = torch.ones(snps, device=device)
                         mask[val_mask_indices] = 0
                         mask_batch = mask.unsqueeze(0).expand(B_val, -1)
                     else:
-                        # --- deterministic random mask ---
                         mask_batch = fixed_val_mask[
                             batch_idx * B_val : batch_idx * B_val + B_val
                         ].to(device)
 
-                    # --- forward diffusion ---
                     t_val = diffusion.sample_timesteps(B_val)
                     x_t_val = diffusion.q_sample(x_val, t_val, mask_batch)
                     tau_batch = tau_tensor.to(device)
 
-                    use_self_cond_val = torch.rand(1).item() < 0.5  # 50% chance
+                    use_self_cond_val = torch.rand(1).item() < 0.5
                     if use_self_cond_val:
                         with torch.no_grad():
                             prev_logits_val = model(x_t_val, t_val, mask_batch, tau_batch)
@@ -418,7 +414,6 @@ def train_masked_conditional(
                         x_self_cond_val = None
 
                     logits_val = model(x_t_val, t_val, mask_batch, tau_batch, x_self_cond=x_self_cond_val)
-
                     loss_val = F.binary_cross_entropy_with_logits(logits_val, x_val, weight=(1 - mask_batch))
                     total_val_loss += loss_val.item() * B_val
 
@@ -434,6 +429,15 @@ def train_masked_conditional(
                 patience_counter += 1
                 if patience_counter >= patience:
                     logging.info(f"⏸ Early stopping at epoch {epoch+1}")
+
+                    wandb.log({
+                        "epoch": epoch + 1,
+                        "train_loss": avg_loss,
+                        "val_loss": val_loss,
+                        "lr": optimizer.param_groups[0]["lr"],
+                        "early_stop": True
+                    })
+
                     return best_epoch
 
         # ====================================================
@@ -446,6 +450,13 @@ def train_masked_conditional(
         if val_loss is not None:
             log_msg += f" | Val Loss: {val_loss:.4f}"
         logging.info(log_msg)
+
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": avg_loss,
+            "val_loss": val_loss,
+            "lr": optimizer.param_groups[0]["lr"]
+        })
 
     return best_epoch
 
@@ -468,12 +479,13 @@ def evaluate_masked_r2_reverse_diffusion(
     diffusion,
     x_data,
     index_file,
+    maf_file,
     device,
     output_path=None,
     batch_size=1024,
     tau_tensor=None,
     n_reverse_runs=1,
-    num_sampling_steps=1000
+    num_sampling_steps=100
 ):
     """
     Evaluate masked R² by running reverse diffusion with self-conditioning.
@@ -555,6 +567,12 @@ def evaluate_masked_r2_reverse_diffusion(
 
         preds[start:end] = pred_accum / n_reverse_runs
 
+    # --- Load SNP IDs and MAFs ---
+    maf_df = pd.read_csv(maf_file, delim_whitespace=True, header=None, names=["SNP", "MAF"])
+
+    # Select only masked SNPs
+    masked_snps = maf_df.iloc[mask_indices].reset_index(drop=True)  # SNPs in same order as mask_indices
+
     # --- Compute per-SNP R² ---
     r2_list = []
     for feat_idx in tqdm(mask_indices, desc="Computing R²", position=0):
@@ -570,8 +588,12 @@ def evaluate_masked_r2_reverse_diffusion(
     )
 
     if output_path:
-        df = pd.DataFrame({"SNP_Index": mask_indices, "R2": r2_list})
-        df.to_csv(output_path, index=False, float_format="%.8f")
+        # Build DataFrame with SNP, R2, MAF
+        out_df = masked_snps.copy()
+        out_df["R2"] = r2_list
+        # Ensure column order
+        out_df = out_df[["SNP", "R2", "MAF"]]
+        out_df.to_csv(output_path, index=False, float_format="%.8f")
 
     return avg_r2
 
@@ -583,7 +605,7 @@ if __name__ == "__main__":
     DATA_DIR = "/scratch2/prateek/genetic_pc_github/results/b38/8020/data"
     TRAIN_FILE = f"{DATA_DIR}/8020_train.txt"
     TEST_FILE = f"{DATA_DIR}/8020_test.txt"
-    INDEX_FILE = "/scratch2/prateek/genetic_pc_github/results/b38/missing_indices.txt"
+    INDEX_FILE = "/scratch2/prateek/genetic_pc_github/results/b38/missing_indices_hum5.txt"
     MAP_FILE = "/scratch2/prateek/DeepLearningImputation/1kg_15_map_b38.txt"
     LEGEND_FILE = "/scratch2/prateek/genetic_pc_github/aux/b38_legend.maf.txt"
 
@@ -601,7 +623,7 @@ if __name__ == "__main__":
     TOTAL_EPOCHS = 200
     PATIENCE = 20
     VAL_SPLIT = 0.1
-    MASK_RATIO = 0.5
+    MASK_RATIO = 0.8
     SKIP_TRAINING = True   # Set True to skip training and load model from disk
 
     # --- Genetic Map / Tau ---
@@ -609,7 +631,7 @@ if __name__ == "__main__":
     H = 4006
 
     # --- Evaluation ---
-    EVAL_BATCH_SIZE = 256
+    EVAL_BATCH_SIZE = 128
     # ============================================================
 
     # --- Setup ---
@@ -649,6 +671,22 @@ if __name__ == "__main__":
     # ============================================================
     if not SKIP_TRAINING:
         logging.info("Training enabled.")
+        
+        # --- Initialize W&B only if training ---
+        wandb.init(
+            project="genetic_diffusion_b38",
+            name=f"bern2_b38_seed{SEED}",
+            config={
+                "lr": LR,
+                "min_lr": MIN_LR,
+                "batch_size": BATCH_SIZE,
+                "epochs": TOTAL_EPOCHS,
+                "mask_ratio": MASK_RATIO,
+                "Ne": Ne,
+                "H": H,
+                "model": "ConditionalReverseConvModel"
+            }
+        )
 
         # Split into train/val
         x_train, x_val = train_test_split(x_data, test_size=VAL_SPLIT, random_state=SEED)
@@ -663,7 +701,7 @@ if __name__ == "__main__":
             min_lr=MIN_LR
         )
 
-        # --- Initial training with early stopping ---
+        # --- Initial training with early stopping (logged to wandb) ---
         trained_epochs = train_masked_conditional(
             reverse_model,
             diffusion,
@@ -681,8 +719,13 @@ if __name__ == "__main__":
         )
         logging.info(f"Best validation model found at {trained_epochs} epochs.")
 
-        # --- Retrain on full dataset ---
-        logging.info(f"🔁 Retraining on full dataset for {trained_epochs} epochs...")
+        # --- Stop wandb logging before retraining ---
+        wandb.finish()
+        logging.info("W&B logging stopped before retraining.")
+
+        # --- Retrain on full dataset (no wandb logging) ---
+        logging.info(f"Retraining on full dataset for {trained_epochs} epochs...")
+
         full_dataset = TensorDataset(torch.cat([x_train, x_val], dim=0))
         reverse_model = ConditionalReverseConvModel(snps=snps).to(device)
         optimizer = torch.optim.Adam(reverse_model.parameters(), lr=LR)
@@ -693,6 +736,7 @@ if __name__ == "__main__":
             min_lr=MIN_LR
         )
 
+        # retraining: no wandb logging here
         train_masked_conditional(
             reverse_model,
             diffusion,
@@ -738,9 +782,10 @@ if __name__ == "__main__":
         diffusion=diffusion,
         x_data=x_test,
         index_file=INDEX_FILE,
+        maf_file=LEGEND_FILE,
         device=device,
         output_path=OUTPUT_RESULTS,
         batch_size=EVAL_BATCH_SIZE,
         tau_tensor=log_tau_tensor
     )
-    logging.info(f"🏁 Final Average R²: {avg_r2:.6f}")
+    logging.info(f"Final Average R²: {avg_r2:.6f}")

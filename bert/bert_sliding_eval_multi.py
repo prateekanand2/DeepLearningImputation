@@ -161,7 +161,7 @@ def infer_and_compute_r2(model_path, test_file, out_file, window_size, stride, b
 
         with open(out_file, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["SNP Set", "R2", "MAF"])
+            writer.writerow(["SNP", "R2", "MAF"])
             i = 0
             for idx in filtered_indices:
                 writer.writerow([snp_names[idx], round(ordered_r2s[i], 6), mafs[idx]])

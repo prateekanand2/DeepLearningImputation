@@ -211,18 +211,41 @@ def mask_whole_snps(input_ids, mask_token_id, mask_percent=0.15, seed=None):
 
     return masked_input, labels
 
+# def train_epoch(model, loader, optimizer, scaler, scheduler, device, mask_token_id, mask_prob, epoch, total_epochs, mask_prob_min=None):
+#     model.train()
+#     losses = []
+#     mask_prob_epoch = get_mask_prob(epoch, total_epochs, mask_prob, mask_prob_min)
+
+#     for batch, tau in loader:
+#         masked, labels = mask_whole_snps(batch, mask_token_id, mask_percent=mask_prob_epoch)
+#         masked, labels, tau = masked.to(device), labels.to(device), tau.to(device)
+
+#         with autocast(device_type=device.type):
+#             attention_mask = (masked != -100).long()
+#             outputs = model(input_ids=masked, attention_mask=attention_mask, labels=labels, tau=tau)
+#             loss = outputs.loss
+
+#         scaler.scale(loss).backward()
+#         scaler.step(optimizer)
+#         scaler.update()
+#         scheduler.step()
+#         optimizer.zero_grad()
+#         losses.append(loss.item())
+
+#     return np.mean(losses), mask_prob_epoch
+
 def train_epoch(model, loader, optimizer, scaler, scheduler, device, mask_token_id, mask_prob, epoch, total_epochs, mask_prob_min=None):
     model.train()
     losses = []
     mask_prob_epoch = get_mask_prob(epoch, total_epochs, mask_prob, mask_prob_min)
 
-    for batch, tau in loader:
+    for (batch,) in loader:
         masked, labels = mask_whole_snps(batch, mask_token_id, mask_percent=mask_prob_epoch)
-        masked, labels, tau = masked.to(device), labels.to(device), tau.to(device)
+        masked, labels = masked.to(device), labels.to(device)
 
         with autocast(device_type=device.type):
             attention_mask = (masked != -100).long()
-            outputs = model(input_ids=masked, attention_mask=attention_mask, labels=labels, tau=tau)
+            outputs = model(input_ids=masked, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
 
         scaler.scale(loss).backward()
@@ -235,6 +258,80 @@ def train_epoch(model, loader, optimizer, scaler, scheduler, device, mask_token_
     return np.mean(losses), mask_prob_epoch
 
 
+# def eval_epoch(model, loader, device, mask_token_id, mask_prob, max_snps=100, calc_per_snp_r2=True):
+#     model.eval()
+#     losses = []
+#     all_probs = []
+#     all_labels = []
+#     per_snp_r2_values = []
+
+#     with torch.no_grad():
+#         for batch, tau in loader:
+#             batch, tau = batch.to(device), tau.to(device)
+#             seq_len = batch.size(1)
+#             num_snps = min(seq_len, max_snps)
+#             snp_indices_to_mask = random.sample(range(seq_len), num_snps)
+
+#             # Global masking for overall metrics
+#             masked, labels = mask_whole_snps(batch, mask_token_id, mask_percent=mask_prob)
+#             masked, labels = masked.to(device), labels.to(device)
+#             attention_mask = (masked != -100).long()
+
+#             with autocast(device_type=device.type):
+#                 outputs = model(input_ids=masked, attention_mask=attention_mask, labels=labels, tau=tau)
+#             loss = outputs.loss
+#             logits = outputs.logits[..., :2]
+
+#             mask = labels != -100
+#             masked_logits = logits[mask]
+#             masked_labels = labels[mask]
+
+#             probs = torch.softmax(masked_logits, dim=-1)[:, 1]
+#             all_probs.append(probs.cpu())
+#             all_labels.append(masked_labels.cpu())
+#             losses.append(loss.item())
+
+#             # Per-SNP masking for subset (only if toggle is on)
+#             # if calc_per_snp_r2:
+#             #     for snp_idx in snp_indices_to_mask:
+#             #         labels_single = torch.full_like(batch, fill_value=-100)
+#             #         masked_single = batch.clone()
+#             #         masked_single[:, snp_idx] = mask_token_id
+#             #         labels_single[:, snp_idx] = batch[:, snp_idx]
+
+#             #         attention_mask_single = (masked_single != -100).long()
+
+#             #         with autocast(device_type=device.type):
+#             #             outputs_single = model(
+#             #                 input_ids=masked_single,
+#             #                 attention_mask=attention_mask_single,
+#             #                 labels=labels_single
+#             #             )
+#             #         logits_single = outputs_single.logits[..., :2]
+
+#             #         probs_single = torch.softmax(logits_single, dim=-1)[:, snp_idx, 1].cpu().numpy()
+#             #         labels_single_np = batch[:, snp_idx].cpu().numpy()
+
+#             #         if np.std(probs_single) > 0 and np.std(labels_single_np) > 0:
+#             #             r, _ = pearsonr(probs_single, labels_single_np)
+#             #             per_snp_r2_values.append(r ** 2)
+#             #         else:
+#             #             per_snp_r2_values.append(0)
+
+#     all_probs = torch.cat(all_probs).numpy()
+#     all_labels = torch.cat(all_labels).numpy()
+#     if np.std(all_probs) == 0 or np.std(all_labels) == 0:
+#         r2_global = 0.0
+#     else:
+#         r, _ = pearsonr(all_probs, all_labels)
+#         r2_global = r ** 2
+
+#     r2_per_snp_mean = float(np.mean(per_snp_r2_values)) if (calc_per_snp_r2 and per_snp_r2_values) else 0.0
+#     brier = brier_score_loss(all_labels, all_probs)
+#     avg_loss = np.mean(losses)
+
+#     return avg_loss, brier, r2_global, r2_per_snp_mean
+
 def eval_epoch(model, loader, device, mask_token_id, mask_prob, max_snps=100, calc_per_snp_r2=True):
     model.eval()
     losses = []
@@ -243,8 +340,8 @@ def eval_epoch(model, loader, device, mask_token_id, mask_prob, max_snps=100, ca
     per_snp_r2_values = []
 
     with torch.no_grad():
-        for batch, tau in loader:
-            batch, tau = batch.to(device), tau.to(device)
+        for (batch,) in loader:
+            batch = batch.to(device)
             seq_len = batch.size(1)
             num_snps = min(seq_len, max_snps)
             snp_indices_to_mask = random.sample(range(seq_len), num_snps)
@@ -255,7 +352,7 @@ def eval_epoch(model, loader, device, mask_token_id, mask_prob, max_snps=100, ca
             attention_mask = (masked != -100).long()
 
             with autocast(device_type=device.type):
-                outputs = model(input_ids=masked, attention_mask=attention_mask, labels=labels, tau=tau)
+                outputs = model(input_ids=masked, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
             logits = outputs.logits[..., :2]
 
@@ -329,40 +426,38 @@ def main(args):
     X = load_txt(args.train_data)
     print(X.shape)
 
-    print("Loading LD map and computing tau...")
-    map_bps, map_cms = load_coarse_map(args.genetic_map)
-    snp_bps = load_snp_positions(args.maf_file)
-    tau_tensor, log_tau_tensor = compute_tau(
-        interpolate_cM_for_snps(snp_bps, map_bps, map_cms),
-        Ne=10000, H=1000
-    )
-    print(log_tau_tensor.shape)
+    # print("Loading LD map and computing tau...")
+    # map_bps, map_cms = load_coarse_map(args.genetic_map)
+    # snp_bps = load_snp_positions(args.maf_file)
+    # tau_tensor, log_tau_tensor = compute_tau(
+    #     interpolate_cM_for_snps(snp_bps, map_bps, map_cms),
+    #     Ne=10000, H=1000
+    # )
+    # print(log_tau_tensor.shape)
 
     X_chunks = sliding_window_chunks(X, window_size=args.seq_len, stride=args.stride)
     # compute tau chunks from global LD
-    tau_chunks = sliding_window_chunks(
-        log_tau_tensor[None, :],  # shape [1, 10000]
-        window_size=args.seq_len,
-        stride=args.stride
-    )  # shape [num_chunks_per_indiv, seq_len]
+    # tau_chunks = sliding_window_chunks(
+    #     log_tau_tensor[None, :],  # shape [1, 10000]
+    #     window_size=args.seq_len,
+    #     stride=args.stride
+    # )  # shape [num_chunks_per_indiv, seq_len]
 
-    num_individuals = X.shape[0]
-    chunks_per_individual = tau_chunks.shape[0]
-    tau_chunks = np.tile(tau_chunks, (num_individuals, 1))  # shape [num_individuals * chunks_per_individual, seq_len]
-    tau_chunks = torch.tensor(tau_chunks, dtype=torch.float32)
+    # num_individuals = X.shape[0]
+    # chunks_per_individual = tau_chunks.shape[0]
+    # tau_chunks = np.tile(tau_chunks, (num_individuals, 1))  # shape [num_individuals * chunks_per_individual, seq_len]
+    # tau_chunks = torch.tensor(tau_chunks, dtype=torch.float32)
 
-    assert tau_chunks.shape[0] == X_chunks.shape[0], \
-        f"tau_chunks {tau_chunks.shape} does not match X_chunks {X_chunks.shape}"
+    # assert tau_chunks.shape[0] == X_chunks.shape[0], \
+    #     f"tau_chunks {tau_chunks.shape} does not match X_chunks {X_chunks.shape}"
 
     print(X_chunks.shape)
 
     X_input_ids = torch.tensor(X_chunks, dtype=torch.long)
-    train_tensor, val_tensor, train_tau, val_tau = train_test_split(
-        X_input_ids, tau_chunks, test_size=0.1, random_state=args.seed
-    )
+    train_tensor, val_tensor = train_test_split(X_input_ids, test_size=0.1, random_state=args.seed)
 
-    train_dataset = TensorDataset(train_tensor, train_tau)
-    val_dataset = TensorDataset(val_tensor, val_tau)
+    train_dataset = TensorDataset(train_tensor)
+    val_dataset = TensorDataset(val_tensor)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
@@ -379,8 +474,8 @@ def main(args):
         mask_token_id=mask_token_id,
         pad_token_id=pad_token_id
     )
-    # model = BertForMaskedLM(config)
-    model = BertWithTau(config)
+    model = BertForMaskedLM(config)
+    # model = BertWithTau(config)
 
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
@@ -458,14 +553,11 @@ def main(args):
     # ------------------------------------------------------------------
     print(f"Retraining on full dataset for {best_epoch} epochs...")
 
-    full_dataset = TensorDataset(
-        torch.cat([train_tensor, val_tensor], dim=0),
-        torch.cat([train_tau, val_tau], dim=0)
-    )
+    full_dataset = TensorDataset(torch.cat([train_tensor, val_tensor], dim=0))
     full_loader = DataLoader(full_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
 
     # Reinitialize model and optimizer for clean retraining
-    model = BertWithTau(config)
+    model = BertForMaskedLM(config)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
     model.to(device)
@@ -480,16 +572,12 @@ def main(args):
         num_training_steps=num_training_steps
     )
 
-    wandb.init(project="snp-imputation", name=f"retrain-seed{args.seed}", config=vars(args), reinit=True)
-    wandb.log({"phase": "retrain_full", "best_epoch_from_val": best_epoch})
-
     for epoch in range(best_epoch):
         train_loss, mask_prob_epoch = train_epoch(
             model, full_loader, optimizer, scaler, scheduler, device,
             mask_token_id, args.mask_prob, epoch, best_epoch, args.mask_prob_min
         )
         print(f"[Retrain] Epoch {epoch+1}/{best_epoch} - Train Loss: {train_loss:.4f}")
-        wandb.log({"retrain/epoch": epoch + 1, "retrain/loss": train_loss})
 
     print("Full retraining complete. Saving final model...")
     final_dir = os.path.join(args.output_dir, "final_full_retrain")
@@ -497,8 +585,6 @@ def main(args):
     model.save_pretrained(final_dir)
     save_minimal_tokenizer(vocab, final_dir)
     print(f"Final model saved to {final_dir}")
-
-    wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BERT for SNP Imputation")
